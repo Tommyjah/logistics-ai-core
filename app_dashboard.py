@@ -78,6 +78,10 @@ with tab1:
         
         except Exception as e:
             st.error(f"Simulation failed: {e}")
+
+# ------------------------------------------------------------------
+# TAB 2: FLEET ASSISTANT & CONTROLS
+# ------------------------------------------------------------------
 with tab2:
     st.header("Fleet Assistant & Controls")
     
@@ -131,6 +135,31 @@ with tab2:
             return df_merged
         except Exception as e:
             st.error(f"Data synchronization breakdown: {e}")
+            return pd.DataFrame()
+
+    # ---------------------------------
+    # 2.5  Custodian Score
+    # ---------------------------------
+    def get_driver_scorecard():
+        try:
+            v_res = supabase.table("fleet_vehicles").select("*").execute().data
+            d_res = supabase.table("drivers").select("*").execute().data
+            if not v_res or not d_res: return pd.DataFrame()
+            
+            df_v = pd.DataFrame(v_res)
+            df_d = pd.DataFrame(d_res)
+            
+            # Calculate delta
+            df_v['delta'] = df_v['current_odometer'] - df_v['last_service_odometer']
+            
+            # Merge and Group
+            df_merged = df_v.merge(df_d[['id', 'full_name']], left_on='current_driver_id', right_on='id', how='left')
+            
+            # Score calculation
+            scorecard = df_merged.groupby('full_name')['delta'].mean().reset_index()
+            scorecard.columns = ['Driver', 'Avg Maintenance Drift (km)']
+            return scorecard.sort_values(by='Avg Maintenance Drift (km)')
+        except Exception as e:
             return pd.DataFrame()
 
     # 3. AI Strategic Insight Layer 
@@ -211,12 +240,22 @@ with tab2:
                 st.rerun()
         else:
             st.error("No valid vehicle entries found.")
+
 # ------------------------------------------------------------------
 # TAB 3: DYNAMIC MAINTENANCE PROJECTIONS (Fixed Confirmation Visibility)
 # ------------------------------------------------------------------
 with tab3:
+    st.header("🏆 Driver Custodian Scorecard")
+    scorecard_df = get_driver_scorecard()
+    if not scorecard_df.empty:
+        st.dataframe(scorecard_df, use_container_width=True, hide_index=True)
+        st.info("💡 Drivers with a lower 'Avg Maintenance Drift' are effectively managing their vehicle service intervals.")
+    else:
+        st.warning("Scorecard data currently unavailable.")
+        
+    st.markdown("---") # Visual separator
     st.header("🗓️ Automated Service Projections")
-    
+
     # PERSISTENT ALERT: Displays the confirmation after the page resets
     if "maintenance_success" in st.session_state and st.session_state.maintenance_success:
         st.success(st.session_state.maintenance_success)
@@ -324,6 +363,7 @@ with tab3:
                     st.error(f"Failed to update database: {e}")
         else:
             st.warning("Please check the thin checkbox row on the left side of a vehicle above to prepare it for maintenance.")
+
 # ------------------------------------------------------------------
 # TAB 4: FLEET FUEL OPTIMIZATION & INTELLIGENCE (Professional Grade)
 # ------------------------------------------------------------------
