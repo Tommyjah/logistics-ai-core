@@ -242,13 +242,22 @@ with tab2:
             st.error("No valid vehicle entries found.")
 
 # ------------------------------------------------------------------
-# TAB 3: DYNAMIC MAINTENANCE PROJECTIONS (Fixed Confirmation Visibility)
+# TAB 3: DYNAMIC MAINTENANCE PROJECTIONS (Polished Production Edition)
 # ------------------------------------------------------------------
 with tab3:
     st.header("🏆 Driver Custodian Scorecard")
     scorecard_df = get_driver_scorecard()
     if not scorecard_df.empty:
-        st.dataframe(scorecard_df, use_container_width=True, hide_index=True)
+        # Clean trailing decimal points from the scorecard view
+        st.dataframe(
+            scorecard_df.style.format({"Avg Maintenance Drift (km)": "{:,.0f}"}), 
+            use_container_width=True, 
+            hide_index=True,
+            column_config={
+                "Driver": "👤 Driver Name",
+                "Avg Maintenance Drift (km)": st.column_config.NumberColumn("📊 Avg Maintenance Drift (KM)")
+            }
+        )
         st.info("💡 Drivers with a lower 'Avg Maintenance Drift' are effectively managing their vehicle service intervals.")
     else:
         st.warning("Scorecard data currently unavailable.")
@@ -324,8 +333,13 @@ with tab3:
         st.subheader("Upcoming Maintenance Schedule")
         st.write("📋 *Check the boxes on the left side of the table rows to select vehicles for maintenance.*")
         
+        # Chained .format() onto your .map() engine to scrub trailing floats cleanly
         selection_event = st.dataframe(
-            df_display.style.map(color_urgency, subset=['km_remaining']),
+            df_display.style.map(color_urgency, subset=['km_remaining'])
+                            .format({
+                                "km_remaining": "{:,.0f}",
+                                "daily_usage_avg": "{:,.1f}"
+                            }),
             use_container_width=True,
             hide_index=True,
             on_select="rerun",
@@ -334,7 +348,7 @@ with tab3:
                 "plate_number": "🚛 Plate Number",
                 "maintenance_due_date": "📅 Est. Maintenance Date",
                 "km_remaining": st.column_config.NumberColumn("⚠️ KM Until Service"),
-                "daily_usage_avg": "📊 Avg Daily KM"
+                "daily_usage_avg": st.column_config.NumberColumn("📊 Avg Daily KM")
             }
         )
         
@@ -363,7 +377,6 @@ with tab3:
                     st.error(f"Failed to update database: {e}")
         else:
             st.warning("Please check the thin checkbox row on the left side of a vehicle above to prepare it for maintenance.")
-
 # ------------------------------------------------------------------
 # TAB 4: FLEET FUEL OPTIMIZATION & INTELLIGENCE (Professional Grade)
 # ------------------------------------------------------------------
@@ -375,10 +388,17 @@ with tab4:
     start_date = col_d1.date_input("Start Date", datetime.now() - timedelta(days=30))
     end_date = col_d2.date_input("End Date", datetime.now())
 
+    # Initialize memory keys so data stays alive when adjusting widgets
+    if "fuel_matrix_loaded" not in st.session_state:
+        st.session_state.fuel_matrix_loaded = False
+    if "cached_df" not in st.session_state:
+        st.session_state.cached_df = None
+    if "cached_summary" not in st.session_state:
+        st.session_state.cached_summary = None
+
     if st.button("Load Fuel Intelligence Matrix"):
         try:
             # 1. Fetch data (Joining vehicles to get plate_number)
-            # We use select("*, fleet_vehicles(plate_number)") to get the plates
             response = supabase.table("fleet_fuel_logs").select("*, fleet_vehicles(plate_number)").execute()
             df = pd.DataFrame(response.data)
             
@@ -398,31 +418,163 @@ with tab4:
                 # 3. Summary Aggregation
                 summary = df.groupby('plate_number').agg({'cost_etb': 'sum', 'km_per_liter': 'mean'}).reset_index()
 
-                # 4. Metrics
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Total Spend", f"{df['cost_etb'].sum():,.0f} ETB")
-                m2.metric("Total Liters", f"{df['liters_fueled'].sum():,.0f} L")
-                m3.metric("Fleet Avg KM/L", f"{df['km_per_liter'].mean():,.2f}")
-                
-                # 5. Graph
-                st.subheader("Efficiency Distribution")
-                st.bar_chart(summary.set_index('plate_number')['km_per_liter'])
-                
-                # 6. Styled Table
-                st.subheader("Performance Matrix")
-                st.dataframe(
-                    summary.style.background_gradient(subset=['km_per_liter'], cmap='RdYlGn'),
-                    use_container_width=True
-                )
-                
-                # 7. Legend
-                st.markdown("""
-                **Performance Legend:**
-                * <span style="color:red">**Red**</span>: Below average efficiency (Check for engine/maintenance issues).
-                * <span style="color:orange">**Yellow**</span>: Moderate efficiency.
-                * <span style="color:green">**Green**</span>: Optimal fuel efficiency.
-                """, unsafe_allow_html=True)
+                # Commit results to app memory vault
+                st.session_state.cached_df = df
+                st.session_state.cached_summary = summary
+                st.session_state.fuel_matrix_loaded = True
             else:
+                st.session_state.fuel_matrix_loaded = False
                 st.info("No data found for the selected date range.")
         except Exception as e:
              st.error(f"Error loading matrix: {e}")
+
+    # Persistent Render Block: If data is loaded in memory, draw the UI elements here
+    if st.session_state.fuel_matrix_loaded:
+        # Pull records safely out of state cache
+        df = st.session_state.cached_df
+        summary = st.session_state.cached_summary
+
+        # 4. Metrics
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total Spend", f"{df['cost_etb'].sum():,.0f} ETB")
+        m2.metric("Total Liters", f"{df['liters_fueled'].sum():,.0f} L")
+        m3.metric("Fleet Avg KM/L", f"{df['km_per_liter'].mean():,.2f}")
+        
+        # 5. Graph
+        st.subheader("Efficiency Distribution")
+        st.bar_chart(summary.set_index('plate_number')['km_per_liter'])
+        
+        # 6. Styled Table
+        st.subheader("Performance Matrix")    
+        st.dataframe(
+            summary.style.background_gradient(subset=['km_per_liter'], cmap='RdYlGn')
+                   .format({"cost_etb": "{:,.2f} ETB", "km_per_liter": "{:,.2f}"}),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "plate_number": "🚛 Plate Number",
+                "cost_etb": "💰 Total Cost",
+                "km_per_liter": "📊 Avg KM / Liter"
+            }
+        ) 
+       
+        # 7. Legend
+        st.markdown("""
+        **Performance Legend:**
+        * <span style="color:red">**Red**</span>: Below average efficiency (Check for engine/maintenance issues).
+        * <span style="color:orange">**Yellow**</span>: Moderate efficiency.
+        * <span style="color:green">**Green**</span>: Optimal fuel efficiency.
+        """, unsafe_allow_html=True)
+
+       # ------------------------------------------------------------------
+        # 8. OPERATIONAL DISPATCH ROUTE CLEARANCE ENGINE (Predictive Fuel Edition)
+        # ------------------------------------------------------------------
+        st.markdown("---")
+        st.subheader("📋 Pre-Dispatch Route Clearance Engine")
+        st.markdown("Verify if a vehicle has an acceptable historical efficiency profile and sufficient fuel level to clear its next trip assignment.")
+
+        # Layout Controls: Row 1
+        col_clear1, col_clear2, col_clear3 = st.columns(3)
+        
+        with col_clear1:
+            available_vehicles = summary['plate_number'].tolist()
+            selected_vehicle = st.selectbox("Assign Vehicle to Route", available_vehicles)
+            
+            # Fetch targeted vehicle's historical performance footprint
+            v_profile = summary[summary['plate_number'] == selected_vehicle].iloc[0]
+            v_efficiency = v_profile['km_per_liter']
+            
+        with col_clear2:
+            # Defined before the slider so math can calculate remaining percentages dynamically
+            tank_size = st.number_input("Vehicle Tank Size (Liters)", min_value=40, max_value=400, value=100, step=10)
+            
+        with col_clear3:
+            target_distance = st.number_input("Target Trip Distance (KM)", min_value=10, max_value=1500, value=250, step=50)
+
+        # --- RECONCILIATION ENGINE: PREDICTIVE CURRENT FUEL LEVEL ---
+        v_logs = df[df['plate_number'] == selected_vehicle].sort_values('fuel_date', ascending=False)
+        
+        predicted_gauge_default = 50  # Operational fallback baseline
+        calculation_insight = "ℹ️ No prior fuel logs found to parse an automated gauge estimation for this vehicle."
+        
+        if not v_logs.empty:
+            latest_log = v_logs.iloc[0]
+            latest_fuel_date = pd.to_datetime(latest_log['fuel_date'])
+            
+            # Calculate days elapsed since the vehicle last visited a pump line
+            current_system_time = pd.to_datetime("2026-05-29")  # Keeps processing perfectly aligned to your database scope
+            days_since_refuel = (current_system_time - latest_fuel_date).days
+            
+            # Extract historical average daily driving baseline for this specific profile
+            v_logs_sorted = v_logs.sort_values('fuel_date')
+            if len(v_logs_sorted) > 1:
+                total_days_active = (v_logs_sorted['fuel_date'].max() - v_logs_sorted['fuel_date'].min()).days
+                total_km_logged = v_logs_sorted['distance_driven'].sum()
+                avg_daily_km = total_km_logged / total_days_active if total_days_active > 0 else 120.0
+            else:
+                avg_daily_km = 120.0  # Fleet fallback average
+                
+            # Compute predictive depletion values
+            est_km_driven_since = max(0, days_since_refuel * avg_daily_km)
+            est_liters_burned = est_km_driven_since / v_efficiency if v_efficiency > 0 else 0
+            
+            # Derive estimated fuel level remaining inside the tank asset
+            est_remaining_liters = max(0, tank_size - est_liters_burned)
+            predicted_gauge_default = int((est_remaining_liters / tank_size) * 100)
+            predicted_gauge_default = min(100, max(0, predicted_gauge_default))
+            
+            calculation_insight = f"""
+            💡 **Predictive Fuel Estimate:** This vehicle last fueled on **{latest_fuel_date.strftime('%Y-%m-%d')}**. 
+            Based on its historical usage of **{avg_daily_km:.1f} KM/day**, it has driven roughly **~{est_km_driven_since:,.0f} KM** since that log entry, 
+            burning **~{est_liters_burned:.1f} Liters**.
+            """
+
+        # Display calculated insight right above the interactive element
+        st.info(calculation_insight)
+        
+        # Interactive slider now opens pre-configured to our data-driven prediction!
+        fuel_gauge = st.slider(
+            "Current Fuel Gauge Status (%)", 
+            min_value=0, 
+            max_value=100, 
+            value=predicted_gauge_default, 
+            step=5
+        )
+
+        # Layout Controls: Row 2 (Status output)
+        col_status = st.columns(1)[0]
+        
+        # Range Math Core
+        current_liters = tank_size * (fuel_gauge / 100.0)
+        estimated_range = current_liters * v_efficiency
+        required_safe_range = target_distance * 1.15
+
+        with col_status:
+            if estimated_range >= required_safe_range:
+                st.success(f"""
+                🟢 **DISPATCH APPROVED** * **Est. Range:** {estimated_range:,.1f} KM ({current_liters:.1f} Liters in tank)  
+                * **Target Trip:** {target_distance} KM  
+                
+                The vehicle meets the route profile requirements and holds a healthy reserve safety buffer.
+                """)
+                
+            elif estimated_range >= target_distance:
+                st.warning(f"""
+                ⚠️ **WARNING: MARGINAL FUEL BUFFER** * **Est. Range:** {estimated_range:,.1f} KM ({current_liters:.1f} Liters in tank)  
+                * **Target Trip:** {target_distance} KM  
+                
+                The truck can technically reach the destination, but the safety threshold is tight (< 15%). Refueling before leaving the yard is recommended to protect against en-route delays.
+                """)
+                
+            else:
+                # Calculate shortfalls and real-world fuel cost impact based on current logs
+                liters_shortfall = (required_safe_range - estimated_range) / v_efficiency
+                avg_historical_price = df['cost_etb'].sum() / df['liters_fueled'].sum() if df['liters_fueled'].sum() > 0 else 85.0
+                refuel_cost_etb = liters_shortfall * avg_historical_price
+                
+                st.error(f"""
+                🚨 **DISPATCH BLOCKED: INSUFFICIENT RANGE** * **Est. Range:** {estimated_range:,.1f} KM  
+                * **Target Trip:** {target_distance} KM  
+                
+                **Required Action:** Top-up the fuel tank by at least **{liters_shortfall:.1f} Liters** (Estimated Voucher Cost: **{refuel_cost_etb:,.2f} ETB**) to clear this vehicle for the assignment.
+                """)
