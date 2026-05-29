@@ -113,6 +113,14 @@ with tab2:
                 df_merged = df_v.copy()
                 df_merged['assigned_driver'] = "Unassigned"
             
+            # --- PATCH: Predictive Maintenance Logic ---
+            df_merged['service_delta'] = df_merged['current_odometer'] - df_merged['last_service_odometer']
+            df_merged['maintenance_alert'] = df_merged.apply(
+                lambda row: "Overdue 🔴" if row['service_delta'] >= row['service_interval'] 
+                else ("Warning 🟡" if row['service_delta'] >= (row['service_interval'] * 0.8) 
+                else "Healthy 🟢"), axis=1
+            )
+            
             INSPECTION_STATUSES = ["Needs Inspection", "Under Maintenance", "bad"]
             if query_type in ["Vehicles in Workshop", "Active Maintenance Queue"]:
                 df_merged = df_merged[df_merged['is_in_workshop'] == True]
@@ -125,10 +133,15 @@ with tab2:
             st.error(f"Data synchronization breakdown: {e}")
             return pd.DataFrame()
 
-    # 3. AI Strategic Insight Layer (Added for your logic needs)
+    # 3. AI Strategic Insight Layer 
     st.subheader("💡 AI Strategic Fleet Insight")
     ai_df = refresh_inquiry_data("List All Vehicles")
     if not ai_df.empty:
+        # Maintenance Alert Logic
+        overdue_count = (ai_df['service_delta'] >= ai_df['service_interval']).sum()
+        if overdue_count > 0:
+            st.warning(f"**Alert**: {overdue_count} vehicles require immediate maintenance.")
+        
         workshop_count = ai_df['is_in_workshop'].sum()
         if workshop_count > (len(ai_df) * 0.25):
             st.warning("High workshop saturation detected. Prioritize inspection queue.")
@@ -141,7 +154,6 @@ with tab2:
     # 4. LEFT COLUMN: INQUIRIES
     with col_read:
         st.subheader("📋 Fleet Inquiries")
-        # Key changed to ensure uniqueness
         query = st.selectbox("What would you like to know?", 
                              ["List All Vehicles", "Vehicles in Workshop", "Vehicles Needing Inspection"],
                              key="tab2_query_choice")
@@ -150,16 +162,16 @@ with tab2:
             inquiry_df = refresh_inquiry_data(query)
 
         if inquiry_df is not None and not inquiry_df.empty:
-            display_cols = ["plate_number", "project_assignment", "current_odometer", "is_in_workshop", "current_driver_id", "assigned_driver"]
+            # Updated to show the new maintenance_alert column
+            display_cols = ["plate_number", "maintenance_alert", "current_odometer", "is_in_workshop", "assigned_driver"]
             existing_cols = [c for c in display_cols if c in inquiry_df.columns]
             st.dataframe(inquiry_df[existing_cols], use_container_width=True, hide_index=True)
         else:
-            st.info("No vehicles match this query.")
+            st.info("No vehicles match this query selection right now.")
 
     # 5. RIGHT COLUMN: WORKSHOP & CREW CONTROL
     with col_write:
         st.subheader("🔧 Workshop & Crew Control")
-        # Logic remains identical to your verified version
         raw_vehicles = supabase.table("fleet_vehicles").select("*").execute().data
         vehicle_lookup = {f"{r.get('plate_number')} ({r.get('project_assignment', '')})": r.get("id") for r in raw_vehicles}
         
@@ -175,6 +187,15 @@ with tab2:
                 supabase.table("fleet_vehicles").update({"is_in_workshop": "Checked Into" in status_choice}).eq("id", selected_id).execute()
                 st.session_state.tab2_success_msg = "Workshop status updated!"
                 st.rerun()
+            
+            # --- PATCH: Maintenance Record Update ---
+            st.markdown("---")
+            st.markdown("**Update Service Record**")
+            new_last_service = st.number_input("Last Service Odometer", value=int(v_rec.get("last_service_odometer", 0)), key=f"tab2_odo_{selected_id}")
+            if st.button("Commit Service Update", key="tab2_btn_service"):
+                supabase.table("fleet_vehicles").update({"last_service_odometer": new_last_service}).eq("id", selected_id).execute()
+                st.session_state.tab2_success_msg = "Service records updated!"
+                st.rerun()
 
             st.markdown("---")
             
@@ -184,9 +205,12 @@ with tab2:
             sel_d = st.selectbox("Assign Driver", ["Unassigned"] + list(drivers_map.keys()), key=f"tab2_driver_{selected_id}")
             
             if st.button("Confirm Crew Assignment", key="tab2_btn_driver"):
-                supabase.table("fleet_vehicles").update({"current_driver_id": drivers_map.get(sel_d)}).eq("id", selected_id).execute()
+                target_driver_id = drivers_map.get(sel_d)
+                supabase.table("fleet_vehicles").update({"current_driver_id": target_driver_id}).eq("id", selected_id).execute()
                 st.session_state.tab2_success_msg = "Crew assignment confirmed!"
                 st.rerun()
+        else:
+            st.error("No valid vehicle entries found.")
 # ------------------------------------------------------------------
 # TAB 3: DYNAMIC MAINTENANCE PROJECTIONS (Fixed Confirmation Visibility)
 # ------------------------------------------------------------------

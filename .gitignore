@@ -4,3 +4,10 @@ __pycache__/
 *.pyc
 *.xlsx
 .streamlit/secrets.toml
+
+
+# Sensitive/Local files
+
+supabase/.temp/
+supabase/.env
+.vscode/
