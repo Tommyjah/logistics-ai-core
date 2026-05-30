@@ -4,6 +4,15 @@ from supabase import create_client
 from datetime import datetime, timedelta
 # Import our new machine learning module
 from ml_engine import prepare_fuel_features, train_fuel_predictor, detect_fuel_anomalies, evaluate_maintenance_risk
+from utils import send_maintenance_alert, generate_fleet_report
+
+# --- 1. STREAMLIT CONFIGURATION (MUST BE FIRST) ---
+# Moved this above refresh_inquiry_data to ensure Streamlit configures before any potential st.error calls
+st.set_page_config(page_title="NGO Fleet Intelligence", layout="wide")
+
+# --- 2. INITIALIZE DATABASE CONNECTION & SECRETS ---
+# Moved this up so any function (like refresh_inquiry_data) can safely use the 'supabase' client
+supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 def refresh_inquiry_data(query_type):
     try:
@@ -49,11 +58,6 @@ def refresh_inquiry_data(query_type):
         st.error(f"Data sync error: {e}")
         return pd.DataFrame()
 
-# --- 1. STREAMLIT CONFIGURATION (MUST BE FIRST) ---
-st.set_page_config(page_title="NGO Fleet Intelligence", layout="wide")
-
-# --- 2. INITIALIZE DATABASE CONNECTION & SECRETS ---
-supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 # --- 3. SESSION STATE MANAGEMENT ---
 if "df_pred" not in st.session_state:
@@ -71,6 +75,64 @@ def get_cached_fuel_model(fuel_logs_data):
     df_fuel = pd.DataFrame(fuel_logs_data)
     return train_fuel_predictor(df_fuel)
 
+# --- 4.2 GLOBAL FUNCTION: FETCH SCORECARD DATA ---
+# --- GLOBAL FUNCTION: FETCH SCORECARD DATA ---
+def get_driver_scorecard():
+    """
+    Fetches actual drivers from Supabase and calculates their average maintenance drift 
+    based on the vehicles assigned to them.
+    """
+    try:
+        # 1. Fetch all drivers
+        d_res = supabase.table("drivers").select("*").execute().data
+        if not d_res:
+            return pd.DataFrame() # Return empty if no drivers exist
+            
+        df_d = pd.DataFrame(d_res)
+        
+        # Safely extract driver names (matching your existing logic)
+        if 'full_name' in df_d.columns:
+            df_d['Driver'] = df_d['full_name'].fillna("Unknown")
+        elif 'name' in df_d.columns:
+            df_d['Driver'] = df_d['name'].fillna("Unknown")
+        else:
+            text_cols = df_d.select_dtypes(include=['object']).columns
+            df_d['Driver'] = df_d[text_cols[0]].fillna("Unknown") if len(text_cols) > 0 else "Driver " + df_d['id'].astype(str)
+
+        # 2. Fetch vehicles to calculate real maintenance drift
+        v_res = supabase.table("fleet_vehicles").select("current_driver_id, current_odometer, last_service_odometer, service_interval").execute().data
+        
+        if v_res:
+            df_v = pd.DataFrame(v_res)
+            
+            # Calculate how far past the interval the vehicle is
+            # Drift = (Current ODO - Last Service ODO) - Service Interval
+            # Positive = Overdue (Bad) | Negative = Safely under interval (Good)
+            df_v['service_delta'] = df_v['current_odometer'] - df_v['last_service_odometer']
+            df_v['drift'] = df_v['service_delta'] - df_v['service_interval']
+            
+            # Average the drift for each driver (in case a driver has multiple vehicles)
+            drift_summary = df_v.groupby('current_driver_id')['drift'].mean().reset_index()
+            drift_summary.rename(columns={'drift': 'Avg Maintenance Drift (km)'}, inplace=True)
+            
+            # Merge the drift calculations with the driver names
+            scorecard = df_d.merge(drift_summary, left_on='id', right_on='current_driver_id', how='left')
+            
+            # If a driver has no assigned vehicles, default their drift to 0
+            scorecard['Avg Maintenance Drift (km)'] = scorecard['Avg Maintenance Drift (km)'].fillna(0)
+        else:
+            # If no vehicles exist yet, load drivers with 0 drift
+            scorecard = df_d.copy()
+            scorecard['Avg Maintenance Drift (km)'] = 0
+            
+        # Clean up the final dataframe for the UI
+        final_df = scorecard[['Driver', 'Avg Maintenance Drift (km)']].sort_values('Avg Maintenance Drift (km)', ascending=True)
+        return final_df
+        
+    except Exception as e:
+        st.error(f"Database error fetching scorecard: {e}")
+        return pd.DataFrame()
+
 # --- 4.5 DATA INTEGRITY & MACHINE LEARNING PROCESSING LAYER ---
 # Pull raw logs WITH the vehicle table join immediately on startup
 raw_logs = supabase.table("fleet_fuel_logs").select("*, fleet_vehicles(plate_number)").execute().data
@@ -86,10 +148,8 @@ if not df.empty:
     # Run the updated anomaly engine
     df = detect_fuel_anomalies(df)
 else:
-    df['is_anomaly'] = False
-    df['anomaly_score'] = 0
-# (If you have a separate summary query block like summary = ..., keep it right here)
-
+    # Ensure columns exist even if df is empty so UI doesn't crash
+    df = pd.DataFrame(columns=['is_anomaly', 'anomaly_score', 'plate_number'])
 
 # --- 5. APP UI HEADERS & TABS ---
 st.title("🚛 Fleet Budgeting & Predictive Intelligence")
@@ -252,10 +312,14 @@ with tab3:
     st.header("🛠️ Predictive Maintenance & Failure Forecasting")
     st.markdown("Automated asset breakdown profiling calculating component degradation risks and overdue service flags.")
 
-    if st.button("Run Predictive Maintenance Audit"):
+    if 'audit_run' not in st.session_state:
+        st.session_state.audit_run = False
+    if 'df_v_evaluated' not in st.session_state:
+        st.session_state.df_v_evaluated = None
+
+    if st.button("Run Predictive Maintenance Audit", key="btn_run_audit"):
         try:
             with st.spinner("Analyzing mechanical degradation vectors..."):
-                # Pull active vehicle profiles and raw work orders from Supabase
                 raw_v = supabase.table("fleet_vehicles").select("*").execute().data
                 raw_m = supabase.table("fleet_maintenance_logs").select("*").execute().data
                 
@@ -263,73 +327,78 @@ with tab3:
                 df_m = pd.DataFrame(raw_m)
 
                 if not df_v.empty:
-                    # Enrich vehicle attributes through our dynamic risk model classifier
-                    df_v_evaluated = evaluate_maintenance_risk(df_v, df_m)
-
-                    # Create custom visual buckets
-                    critical_trucks = df_v_evaluated[df_v_evaluated['risk_status'] == "Critical Risk"]
-                    elevated_trucks = df_v_evaluated[df_v_evaluated['risk_status'] == "Elevated Risk"]
-
-                    # Display Executive Warning Metrics Cards
-                    col_p1, col_p2, col_p3 = st.columns(3)
-                    col_p1.metric("Total Monitored Trucks", len(df_v_evaluated))
-                    col_p2.metric("Critical Red Alerts", len(critical_trucks), 
-                                  delta="Immediate Service Required" if len(critical_trucks) > 0 else "Clear", 
-                                  delta_color="inverse")
-                    col_p3.metric("Elevated Warnings", len(elevated_trucks))
-
-                    # Actionable Alerts Box
-                    if not critical_trucks.empty:
-                        st.error("⚠️ **CRITICAL MECHANICAL FAILURE RISKS DETECTED**")
-                        st.dataframe(
-                            critical_trucks[['plate_number', 'vehicle_model', 'breakdown_risk_score', 'risk_status']],
-                            column_config={
-                                "plate_number": "🚛 Plate Number",
-                                "vehicle_model": "Model Type",
-                                "breakdown_risk_score": st.column_config.ProgressColumn("Risk Score", format="%d%%", min_value=0, max_value=100),
-                                "risk_status": "Risk Status"
-                            },
-                            hide_index=True,
-                            use_container_width=True
-                        )
-                    else:
-                        st.success("🟢 **FLEET MECHANICAL HEALTH OPTIMAL:** No active vehicles have flagged critical degradation variables.")
-
-                    # Comprehensive Fleet View Table
-                    st.subheader("📋 Master Fleet Health Registry")
-                    
-                    # Ensure column names match your database exactly
-                    display_odo_col = 'current_odometer' 
-                    
-                    st.dataframe(
-                        df_v_evaluated[['plate_number', 'vehicle_model', display_odo_col, 'breakdown_risk_score', 'risk_status']].sort_values('breakdown_risk_score', ascending=False),
-                        column_config={
-                            "plate_number": "🚛 Plate Number",
-                            "vehicle_model": "Model Type",
-                            display_odo_col: st.column_config.NumberColumn("Current Odometer", format="%d KM"),
-                            "breakdown_risk_score": st.column_config.ProgressColumn("Risk Index Score", format="%d%%", min_value=0, max_value=100),
-                            "risk_status": "Risk Tier Status"
-                        },
-                        hide_index=True,
-                        use_container_width=True
-                    )
+                    st.session_state.df_v_evaluated = evaluate_maintenance_risk(df_v, df_m)
+                    st.session_state.audit_run = True
                 else:
                     st.info("No active vehicle records found inside the database.")
         except Exception as e:
             st.error(f"Maintenance Engine execution error: {e}")
 
+    if st.session_state.audit_run and st.session_state.df_v_evaluated is not None:
+        df_v_evaluated = st.session_state.df_v_evaluated
+        
+        critical_trucks = df_v_evaluated[df_v_evaluated['risk_status'] == "Critical Risk"]
+        elevated_trucks = df_v_evaluated[df_v_evaluated['risk_status'] == "Elevated Risk"]
+
+        col_p1, col_p2, col_p3 = st.columns(3)
+        col_p1.metric("Total Monitored Trucks", len(df_v_evaluated))
+        col_p2.metric("Critical Red Alerts", len(critical_trucks), 
+                      delta="Immediate Service Required" if len(critical_trucks) > 0 else "Clear", 
+                      delta_color="inverse")
+        col_p3.metric("Elevated Warnings", len(elevated_trucks))
+
+        if not critical_trucks.empty:
+            st.error("⚠️ **CRITICAL MECHANICAL FAILURE RISKS DETECTED**")
+            st.dataframe(
+                critical_trucks[['plate_number', 'vehicle_model', 'breakdown_risk_score', 'risk_status']],
+                column_config={
+                    "plate_number": "🚛 Plate Number",
+                    "vehicle_model": "Model Type",
+                    "breakdown_risk_score": st.column_config.ProgressColumn("Risk Score", format="%d%%", min_value=0, max_value=100),
+                    "risk_status": "Risk Status"
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+        else:
+            st.success("🟢 **FLEET MECHANICAL HEALTH OPTIMAL:** No active vehicles have flagged critical degradation variables.")
+
+        st.subheader("📋 Master Fleet Health Registry")
+        display_odo_col = 'current_odometer' 
+        st.dataframe(
+            df_v_evaluated[['plate_number', 'vehicle_model', display_odo_col, 'breakdown_risk_score', 'risk_status']].sort_values('breakdown_risk_score', ascending=False),
+            column_config={
+                "plate_number": "🚛 Plate Number",
+                "vehicle_model": "Model Type",
+                display_odo_col: st.column_config.NumberColumn("Current Odometer", format="%d KM"),
+                "breakdown_risk_score": st.column_config.ProgressColumn("Risk Index Score", format="%d%%", min_value=0, max_value=100),
+                "risk_status": "Risk Tier Status"
+            },
+            hide_index=True,
+            use_container_width=True
+        )
+
+        if st.button("Generate PDF Report", key="btn_pdf_report"):
+            with st.spinner("Compiling report..."):
+                report_file = generate_fleet_report(st.session_state.df_v_evaluated)
+                with open(report_file, "rb") as f:
+                    st.download_button(
+                        label="📥 Download PDF",
+                        data=f,
+                        file_name="fleet_report.pdf",
+                        mime="application/pdf"
+                    )
+
     st.markdown("---") 
-    # (Rest of your code for Scorecard and Service Projections follows here...)    
+    
     # ==================================================================
     # 🏆 DRIVER CUSTODIAN SCORECARD
     # ==================================================================
     st.header("🏆 Driver Custodian Scorecard")
     
-    # Safely call scorecard data
     try:
         scorecard_df = get_driver_scorecard()
         if not scorecard_df.empty:
-            # Clean trailing decimal points from the scorecard view
             st.dataframe(
                 scorecard_df.style.format({"Avg Maintenance Drift (km)": "{:,.0f}"}), 
                 use_container_width=True, 
@@ -345,20 +414,18 @@ with tab3:
     except Exception as e:
         st.warning(f"Driver scorecard module not initialized. Check global definitions. ({e})")
         
-    st.markdown("---") # Visual separator
+    st.markdown("---") 
 
     # ==================================================================
     # 🗓️ AUTOMATED SERVICE PROJECTIONS ENGINE
     # ==================================================================
     st.header("🗓️ Automated Service Projections")
 
-    # PERSISTENT ALERT: Displays the confirmation after the page resets
     if "maintenance_success" in st.session_state and st.session_state.maintenance_success:
         st.success(st.session_state.maintenance_success)
         st.balloons()
-        del st.session_state.maintenance_success  # Clear it so it won't show again on next actions
+        del st.session_state.maintenance_success
     
-    # ADDED 'key' TO PREVENT DUPLICATE ELEMENT ERROR
     interval = st.selectbox(
         "Select Target Service Interval (KM)", 
         [5000, 10000], 
@@ -366,9 +433,8 @@ with tab3:
         key="maintenance_interval_select" 
     )
     
-    if st.button("Generate Maintenance Timeline"):
+    if st.button("Generate Maintenance Timeline", key="btn_gen_timeline"):
         try:
-            # 1. Fetch data
             v_data = supabase.table("fleet_vehicles").select("id, plate_number, current_odometer").execute().data
             fuel_logs = supabase.table("fleet_fuel_logs").select("vehicle_id, odometer_reading, fuel_date").execute().data
             df_fuel = pd.DataFrame(fuel_logs)
@@ -380,7 +446,6 @@ with tab3:
             today = datetime.now()
             
             for v in v_data:
-                # Dynamic Usage Calculation
                 vehicle_history = df_fuel[df_fuel['vehicle_id'] == v['id']].sort_values('fuel_date') if not df_fuel.empty else pd.DataFrame()
                 if len(vehicle_history) >= 2:
                     dist = vehicle_history['odometer_reading'].iloc[-1] - vehicle_history['odometer_reading'].iloc[0]
@@ -392,7 +457,6 @@ with tab3:
                 curr_odo = v.get("current_odometer") or 0
                 remaining = interval - (curr_odo % interval)
                 
-                # Calculate Estimated Maintenance Date
                 days_until = int(remaining / daily_avg) if remaining > 0 else 0
                 est_date = (today + timedelta(days=days_until)).strftime("%Y-%m-%d")
                 
@@ -408,11 +472,9 @@ with tab3:
         except Exception as e:
             st.error(f"Error: {e}")
 
-    # 2. RESTORED DISPLAY & STYLING WITH SELECTION
     if "df_pred" in st.session_state and st.session_state.df_pred is not None:
         df_display = st.session_state.df_pred
         
-        # Color coding logic
         def color_urgency(val):
             if val < 500: return 'background-color: #ff4b4b; color: white'
             if val < 1500: return 'background-color: #ffa500; color: black'
@@ -421,7 +483,6 @@ with tab3:
         st.subheader("Upcoming Maintenance Schedule")
         st.write("📋 *Check the boxes on the left side of the table rows to select vehicles for maintenance.*")
         
-        # Chained .format() onto your .map() engine to scrub trailing floats cleanly
         selection_event = st.dataframe(
             df_display.style.map(color_urgency, subset=['km_remaining'])
                             .format({
@@ -443,23 +504,34 @@ with tab3:
         st.divider()
         st.subheader("🛠️ Take Action (Send to Maintenance)")
         
-        # Extracted rows matching standard selection event object mapping
         selected_row_indices = selection_event.selection.rows
         
         if selected_row_indices:
             selected_plates = df_display.iloc[selected_row_indices]['plate_number'].unique().tolist()
             
-            # Confirmation Area
             st.info(f"**Selected Vehicle Queue:** {', '.join(selected_plates)}")
             
-            if st.button("Confirm: Send Selected Vehicles to Maintenance Workshop"):
+            if st.button("Confirm: Send Selected Vehicles to Maintenance Workshop", key="btn_confirm_maint"):
                 try:
+                    # 1. Update the Database
                     for plate in selected_plates:
                         supabase.table("fleet_vehicles").update({"is_in_workshop": True}).eq("plate_number", plate).execute()
                     
-                    # STAGE CONFIRMATION MESSAGE: Stored safely in session state before rerun
+                    # =========================================================
+                    # 📩 EMAIL ALERT INTEGRATION (FIXED & ACTIVATED)
+                    # =========================================================
+                    try:
+                        # Calls your imported function from utils.py
+                        send_maintenance_alert(selected_plates) 
+                        st.toast("📧 Email alert successfully dispatched!")
+                    except Exception as email_err:
+                        # If the email fails (e.g. bad credentials), it won't crash the database update
+                        st.warning(f"Database updated, but email alert failed to send: {email_err}")
+                    # =========================================================
+
+                    # 3. Success Message & Reset
                     st.session_state.maintenance_success = f"Successfully registered {len(selected_plates)} vehicle(s) to Maintenance!"
-                    st.session_state.df_pred = None  # Clear cache to force clean database fetch next time
+                    st.session_state.df_pred = None  
                     st.rerun() 
                 except Exception as e:
                     st.error(f"Failed to update database: {e}")
