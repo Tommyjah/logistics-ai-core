@@ -2,14 +2,96 @@ import streamlit as st
 import pandas as pd
 from supabase import create_client
 from datetime import datetime, timedelta
+# Import our new machine learning module
+from ml_engine import prepare_fuel_features, train_fuel_predictor, detect_fuel_anomalies, evaluate_maintenance_risk
 
-# --- INITIALIZE DATABASE CONNECTION ---
+def refresh_inquiry_data(query_type):
+    try:
+        v_res = supabase.table("fleet_vehicles").select("*").execute().data
+        d_res = supabase.table("drivers").select("*").execute().data
+        
+        df_v = pd.DataFrame(v_res) if v_res else pd.DataFrame()
+        df_d = pd.DataFrame(d_res) if d_res else pd.DataFrame()
+        
+        if df_v.empty: return pd.DataFrame()
+            
+        if not df_d.empty:
+            if 'full_name' in df_d.columns:
+                df_d['driver_name_clean'] = df_d['full_name'].fillna("Unknown")
+            elif 'name' in df_d.columns:
+                df_d['driver_name_clean'] = df_d['name'].fillna("Unknown")
+            else:
+                text_cols = df_d.select_dtypes(include=['object']).columns
+                df_d['driver_name_clean'] = df_d[text_cols[0]].fillna("Unknown") if len(text_cols) > 0 else "Driver " + df_d['id'].astype(str)
+            
+            df_merged = df_v.merge(df_d[['id', 'driver_name_clean']], left_on="current_driver_id", right_on="id", how="left")
+            df_merged['assigned_driver'] = df_merged['driver_name_clean'].fillna("Unassigned")
+        else:
+            df_merged = df_v.copy()
+            df_merged['assigned_driver'] = "Unassigned"
+        
+        df_merged['service_delta'] = df_merged['current_odometer'] - df_merged['last_service_odometer']
+        df_merged['maintenance_alert'] = df_merged.apply(
+            lambda row: "Overdue 🔴" if row['service_delta'] >= row['service_interval'] 
+            else ("Warning 🟡" if row['service_delta'] >= (row['service_interval'] * 0.8) 
+            else "Healthy 🟢"), axis=1
+        )
+        
+        INSPECTION_STATUSES = ["Needs Inspection", "Under Maintenance", "bad"]
+        if query_type in ["Vehicles in Workshop", "Active Maintenance Queue"]:
+            df_merged = df_merged[df_merged['is_in_workshop'] == True]
+        elif query_type == "Vehicles Needing Inspection":
+            if 'condition_status' in df_merged.columns:
+                df_merged = df_merged[df_merged['condition_status'].isin(INSPECTION_STATUSES)]
+        
+        return df_merged
+    except Exception as e:
+        st.error(f"Data sync error: {e}")
+        return pd.DataFrame()
+
+# --- 1. STREAMLIT CONFIGURATION (MUST BE FIRST) ---
+st.set_page_config(page_title="NGO Fleet Intelligence", layout="wide")
+
+# --- 2. INITIALIZE DATABASE CONNECTION & SECRETS ---
 supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
+# --- 3. SESSION STATE MANAGEMENT ---
 if "df_pred" not in st.session_state:
     st.session_state.df_pred = None
 
-st.set_page_config(page_title="NGO Fleet Intelligence", layout="wide")
+# --- 4. CACHED ML MODEL COMPILATION INTERFACE ---
+@st.cache_resource
+def get_cached_fuel_model(fuel_logs_data):
+    """
+    Compiles or updates the active Random Forest model cache 
+    directly within Streamlit's application memory scope.
+    """
+    if not fuel_logs_data:
+        return None
+    df_fuel = pd.DataFrame(fuel_logs_data)
+    return train_fuel_predictor(df_fuel)
+
+# --- 4.5 DATA INTEGRITY & MACHINE LEARNING PROCESSING LAYER ---
+# Pull raw logs WITH the vehicle table join immediately on startup
+raw_logs = supabase.table("fleet_fuel_logs").select("*, fleet_vehicles(plate_number)").execute().data
+df = pd.DataFrame(raw_logs)
+
+if not df.empty:
+    # Safely extract the nested plate number right away
+    if 'fleet_vehicles' in df.columns:
+        df['plate_number'] = df['fleet_vehicles'].apply(lambda x: x['plate_number'] if x else "Unknown")
+    else:
+        df['plate_number'] = "Unknown"
+    
+    # Run the updated anomaly engine
+    df = detect_fuel_anomalies(df)
+else:
+    df['is_anomaly'] = False
+    df['anomaly_score'] = 0
+# (If you have a separate summary query block like summary = ..., keep it right here)
+
+
+# --- 5. APP UI HEADERS & TABS ---
 st.title("🚛 Fleet Budgeting & Predictive Intelligence")
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -18,7 +100,6 @@ tab1, tab2, tab3, tab4 = st.tabs([
     "Maintenance Forecast", 
     "Fuel Analytics"
 ])
-
 # ------------------------------------------------------------------
 # TAB 1: FINANCIAL PREDICTIVE SIMULATOR
 # (Ported from @app.post("/analyze-fleet"))
@@ -85,92 +166,19 @@ with tab1:
 with tab2:
     st.header("Fleet Assistant & Controls")
     
-    # 1. Persistent Toast Notification Handler (With Balloons!)
+    # 1. Toast Notification
     if "tab2_success_msg" in st.session_state and st.session_state.tab2_success_msg:
         st.success(st.session_state.tab2_success_msg)
         st.balloons()
         del st.session_state.tab2_success_msg
 
-    # 2. Reusable Pipeline: Dynamic column discovery
-    def refresh_inquiry_data(query_type):
-        try:
-            v_res = supabase.table("fleet_vehicles").select("*").execute().data
-            d_res = supabase.table("drivers").select("*").execute().data
-            
-            df_v = pd.DataFrame(v_res) if v_res else pd.DataFrame()
-            df_d = pd.DataFrame(d_res) if d_res else pd.DataFrame()
-            
-            if df_v.empty: return pd.DataFrame()
-                
-            if not df_d.empty:
-                if 'full_name' in df_d.columns:
-                    df_d['driver_name_clean'] = df_d['full_name'].fillna("Unknown")
-                elif 'name' in df_d.columns:
-                    df_d['driver_name_clean'] = df_d['name'].fillna("Unknown")
-                else:
-                    text_cols = df_d.select_dtypes(include=['object']).columns
-                    df_d['driver_name_clean'] = df_d[text_cols[0]].fillna("Unknown") if len(text_cols) > 0 else "Driver " + df_d['id'].astype(str)
-                
-                df_merged = df_v.merge(df_d[['id', 'driver_name_clean']], left_on="current_driver_id", right_on="id", how="left")
-                df_merged['assigned_driver'] = df_merged['driver_name_clean'].fillna("Unassigned")
-            else:
-                df_merged = df_v.copy()
-                df_merged['assigned_driver'] = "Unassigned"
-            
-            # --- PATCH: Predictive Maintenance Logic ---
-            df_merged['service_delta'] = df_merged['current_odometer'] - df_merged['last_service_odometer']
-            df_merged['maintenance_alert'] = df_merged.apply(
-                lambda row: "Overdue 🔴" if row['service_delta'] >= row['service_interval'] 
-                else ("Warning 🟡" if row['service_delta'] >= (row['service_interval'] * 0.8) 
-                else "Healthy 🟢"), axis=1
-            )
-            
-            INSPECTION_STATUSES = ["Needs Inspection", "Under Maintenance", "bad"]
-            if query_type in ["Vehicles in Workshop", "Active Maintenance Queue"]:
-                df_merged = df_merged[df_merged['is_in_workshop'] == True]
-            elif query_type == "Vehicles Needing Inspection":
-                if 'condition_status' in df_merged.columns:
-                    df_merged = df_merged[df_merged['condition_status'].isin(INSPECTION_STATUSES)]
-                
-            return df_merged
-        except Exception as e:
-            st.error(f"Data synchronization breakdown: {e}")
-            return pd.DataFrame()
-
-    # ---------------------------------
-    # 2.5  Custodian Score
-    # ---------------------------------
-    def get_driver_scorecard():
-        try:
-            v_res = supabase.table("fleet_vehicles").select("*").execute().data
-            d_res = supabase.table("drivers").select("*").execute().data
-            if not v_res or not d_res: return pd.DataFrame()
-            
-            df_v = pd.DataFrame(v_res)
-            df_d = pd.DataFrame(d_res)
-            
-            # Calculate delta
-            df_v['delta'] = df_v['current_odometer'] - df_v['last_service_odometer']
-            
-            # Merge and Group
-            df_merged = df_v.merge(df_d[['id', 'full_name']], left_on='current_driver_id', right_on='id', how='left')
-            
-            # Score calculation
-            scorecard = df_merged.groupby('full_name')['delta'].mean().reset_index()
-            scorecard.columns = ['Driver', 'Avg Maintenance Drift (km)']
-            return scorecard.sort_values(by='Avg Maintenance Drift (km)')
-        except Exception as e:
-            return pd.DataFrame()
-
-    # 3. AI Strategic Insight Layer 
+    # 3. AI Strategic Insight
     st.subheader("💡 AI Strategic Fleet Insight")
     ai_df = refresh_inquiry_data("List All Vehicles")
     if not ai_df.empty:
-        # Maintenance Alert Logic
         overdue_count = (ai_df['service_delta'] >= ai_df['service_interval']).sum()
         if overdue_count > 0:
             st.warning(f"**Alert**: {overdue_count} vehicles require immediate maintenance.")
-        
         workshop_count = ai_df['is_in_workshop'].sum()
         if workshop_count > (len(ai_df) * 0.25):
             st.warning("High workshop saturation detected. Prioritize inspection queue.")
@@ -180,7 +188,6 @@ with tab2:
 
     col_read, col_write = st.columns([1, 1])
 
-    # 4. LEFT COLUMN: INQUIRIES
     with col_read:
         st.subheader("📋 Fleet Inquiries")
         query = st.selectbox("What would you like to know?", 
@@ -191,14 +198,10 @@ with tab2:
             inquiry_df = refresh_inquiry_data(query)
 
         if inquiry_df is not None and not inquiry_df.empty:
-            # Updated to show the new maintenance_alert column
             display_cols = ["plate_number", "maintenance_alert", "current_odometer", "is_in_workshop", "assigned_driver"]
             existing_cols = [c for c in display_cols if c in inquiry_df.columns]
             st.dataframe(inquiry_df[existing_cols], use_container_width=True, hide_index=True)
-        else:
-            st.info("No vehicles match this query selection right now.")
 
-    # 5. RIGHT COLUMN: WORKSHOP & CREW CONTROL
     with col_write:
         st.subheader("🔧 Workshop & Crew Control")
         raw_vehicles = supabase.table("fleet_vehicles").select("*").execute().data
@@ -217,52 +220,136 @@ with tab2:
                 st.session_state.tab2_success_msg = "Workshop status updated!"
                 st.rerun()
             
-            # --- PATCH: Maintenance Record Update ---
-            st.markdown("---")
+            # Maintenance Log Form
+            with st.expander("➕ Log New Maintenance Service"):
+                with st.form("service_form"):
+                    odo_reading = st.number_input("Odometer Reading at Service (KM)", min_value=0)
+                    service_type = st.selectbox("Service Type", ["Oil Change", "Brake Repair", "Tire Rotation", "Full Inspection"])
+                    submit_btn = st.form_submit_button("Submit Service Log")
+                    if submit_btn:
+                        supabase.table("fleet_maintenance_logs").insert({
+                            "vehicle_id": selected_id,
+                            "odometer_reading": odo_reading,
+                            "service_type": service_type,
+                            "service_date": pd.Timestamp.now().strftime('%Y-%m-%d')
+                        }).execute()
+                        st.success(f"Logged {service_type}!")
+                        st.rerun()
+            
+            # Service Update
             st.markdown("**Update Service Record**")
             new_last_service = st.number_input("Last Service Odometer", value=int(v_rec.get("last_service_odometer", 0)), key=f"tab2_odo_{selected_id}")
             if st.button("Commit Service Update", key="tab2_btn_service"):
                 supabase.table("fleet_vehicles").update({"last_service_odometer": new_last_service}).eq("id", selected_id).execute()
-                st.session_state.tab2_success_msg = "Service records updated!"
                 st.rerun()
-
-            st.markdown("---")
-            
-            # Crew Assignment
-            d_res = supabase.table("drivers").select("*").execute().data
-            drivers_map = {f"{d.get('full_name', 'Driver ' + str(d['id']))}": d['id'] for d in d_res}
-            sel_d = st.selectbox("Assign Driver", ["Unassigned"] + list(drivers_map.keys()), key=f"tab2_driver_{selected_id}")
-            
-            if st.button("Confirm Crew Assignment", key="tab2_btn_driver"):
-                target_driver_id = drivers_map.get(sel_d)
-                supabase.table("fleet_vehicles").update({"current_driver_id": target_driver_id}).eq("id", selected_id).execute()
-                st.session_state.tab2_success_msg = "Crew assignment confirmed!"
-                st.rerun()
-        else:
-            st.error("No valid vehicle entries found.")
-
 # ------------------------------------------------------------------
 # TAB 3: DYNAMIC MAINTENANCE PROJECTIONS (Polished Production Edition)
 # ------------------------------------------------------------------
 with tab3:
+    # ==================================================================
+    # 💥 INTELLIGENT PREDICTIVE MAINTENANCE & FAILURE FORECASTING ENGINE
+    # ==================================================================
+    st.header("🛠️ Predictive Maintenance & Failure Forecasting")
+    st.markdown("Automated asset breakdown profiling calculating component degradation risks and overdue service flags.")
+
+    if st.button("Run Predictive Maintenance Audit"):
+        try:
+            with st.spinner("Analyzing mechanical degradation vectors..."):
+                # Pull active vehicle profiles and raw work orders from Supabase
+                raw_v = supabase.table("fleet_vehicles").select("*").execute().data
+                raw_m = supabase.table("fleet_maintenance_logs").select("*").execute().data
+                
+                df_v = pd.DataFrame(raw_v)
+                df_m = pd.DataFrame(raw_m)
+
+                if not df_v.empty:
+                    # Enrich vehicle attributes through our dynamic risk model classifier
+                    df_v_evaluated = evaluate_maintenance_risk(df_v, df_m)
+
+                    # Create custom visual buckets
+                    critical_trucks = df_v_evaluated[df_v_evaluated['risk_status'] == "Critical Risk"]
+                    elevated_trucks = df_v_evaluated[df_v_evaluated['risk_status'] == "Elevated Risk"]
+
+                    # Display Executive Warning Metrics Cards
+                    col_p1, col_p2, col_p3 = st.columns(3)
+                    col_p1.metric("Total Monitored Trucks", len(df_v_evaluated))
+                    col_p2.metric("Critical Red Alerts", len(critical_trucks), 
+                                  delta="Immediate Service Required" if len(critical_trucks) > 0 else "Clear", 
+                                  delta_color="inverse")
+                    col_p3.metric("Elevated Warnings", len(elevated_trucks))
+
+                    # Actionable Alerts Box
+                    if not critical_trucks.empty:
+                        st.error("⚠️ **CRITICAL MECHANICAL FAILURE RISKS DETECTED**")
+                        st.dataframe(
+                            critical_trucks[['plate_number', 'vehicle_model', 'breakdown_risk_score', 'risk_status']],
+                            column_config={
+                                "plate_number": "🚛 Plate Number",
+                                "vehicle_model": "Model Type",
+                                "breakdown_risk_score": st.column_config.ProgressColumn("Risk Score", format="%d%%", min_value=0, max_value=100),
+                                "risk_status": "Risk Status"
+                            },
+                            hide_index=True,
+                            use_container_width=True
+                        )
+                    else:
+                        st.success("🟢 **FLEET MECHANICAL HEALTH OPTIMAL:** No active vehicles have flagged critical degradation variables.")
+
+                    # Comprehensive Fleet View Table
+                    st.subheader("📋 Master Fleet Health Registry")
+                    
+                    # Ensure column names match your database exactly
+                    display_odo_col = 'current_odometer' 
+                    
+                    st.dataframe(
+                        df_v_evaluated[['plate_number', 'vehicle_model', display_odo_col, 'breakdown_risk_score', 'risk_status']].sort_values('breakdown_risk_score', ascending=False),
+                        column_config={
+                            "plate_number": "🚛 Plate Number",
+                            "vehicle_model": "Model Type",
+                            display_odo_col: st.column_config.NumberColumn("Current Odometer", format="%d KM"),
+                            "breakdown_risk_score": st.column_config.ProgressColumn("Risk Index Score", format="%d%%", min_value=0, max_value=100),
+                            "risk_status": "Risk Tier Status"
+                        },
+                        hide_index=True,
+                        use_container_width=True
+                    )
+                else:
+                    st.info("No active vehicle records found inside the database.")
+        except Exception as e:
+            st.error(f"Maintenance Engine execution error: {e}")
+
+    st.markdown("---") 
+    # (Rest of your code for Scorecard and Service Projections follows here...)    
+    # ==================================================================
+    # 🏆 DRIVER CUSTODIAN SCORECARD
+    # ==================================================================
     st.header("🏆 Driver Custodian Scorecard")
-    scorecard_df = get_driver_scorecard()
-    if not scorecard_df.empty:
-        # Clean trailing decimal points from the scorecard view
-        st.dataframe(
-            scorecard_df.style.format({"Avg Maintenance Drift (km)": "{:,.0f}"}), 
-            use_container_width=True, 
-            hide_index=True,
-            column_config={
-                "Driver": "👤 Driver Name",
-                "Avg Maintenance Drift (km)": st.column_config.NumberColumn("📊 Avg Maintenance Drift (KM)")
-            }
-        )
-        st.info("💡 Drivers with a lower 'Avg Maintenance Drift' are effectively managing their vehicle service intervals.")
-    else:
-        st.warning("Scorecard data currently unavailable.")
+    
+    # Safely call scorecard data
+    try:
+        scorecard_df = get_driver_scorecard()
+        if not scorecard_df.empty:
+            # Clean trailing decimal points from the scorecard view
+            st.dataframe(
+                scorecard_df.style.format({"Avg Maintenance Drift (km)": "{:,.0f}"}), 
+                use_container_width=True, 
+                hide_index=True,
+                column_config={
+                    "Driver": "👤 Driver Name",
+                    "Avg Maintenance Drift (km)": st.column_config.NumberColumn("📊 Avg Maintenance Drift (KM)")
+                }
+            )
+            st.info("💡 Drivers with a lower 'Avg Maintenance Drift' are effectively managing their vehicle service intervals.")
+        else:
+            st.warning("Scorecard data currently unavailable.")
+    except Exception as e:
+        st.warning(f"Driver scorecard module not initialized. Check global definitions. ({e})")
         
     st.markdown("---") # Visual separator
+
+    # ==================================================================
+    # 🗓️ AUTOMATED SERVICE PROJECTIONS ENGINE
+    # ==================================================================
     st.header("🗓️ Automated Service Projections")
 
     # PERSISTENT ALERT: Displays the confirmation after the page resets
@@ -285,6 +372,7 @@ with tab3:
             v_data = supabase.table("fleet_vehicles").select("id, plate_number, current_odometer").execute().data
             fuel_logs = supabase.table("fleet_fuel_logs").select("vehicle_id, odometer_reading, fuel_date").execute().data
             df_fuel = pd.DataFrame(fuel_logs)
+            
             if not df_fuel.empty:
                 df_fuel['fuel_date'] = pd.to_datetime(df_fuel['fuel_date'])
             
@@ -383,6 +471,79 @@ with tab3:
 with tab4:
     st.header("⛽ Fleet Fuel Optimization & Intelligence")
     
+    # ==================================================================
+    # 💥 INTELLIGENT FUEL INTEGRITY & FRAUD AUDIT LAYER (Isolation Forest)
+    # ==================================================================
+    st.subheader("🔍 Intelligent Fuel Integrity & Fraud Audit")
+    st.markdown("Real-time anomaly triage powered by an unsupervised Isolation Forest engine tracking efficiency drops and cost variances.")
+
+    # Check if anomalies were processed in the global dataframe layer
+    if 'is_anomaly' in df.columns:
+        anomalous_data = df[df['is_anomaly'] == True].copy()
+    else:
+        anomalous_data = pd.DataFrame()
+
+    if not anomalous_data.empty:
+        # High-visibility risk metric scorecard cards
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.metric(
+                label="Flagged High-Risk Entries", 
+                value=len(anomalous_data), 
+                delta="- Review Required", 
+                delta_color="inverse"
+            )
+        with col_m2:
+            st.metric(
+                label="Max Deviation Risk Score", 
+                value=f"{anomalous_data['anomaly_score'].max()}%", 
+                delta="Critical Alert Level", 
+                delta_color="inverse"
+            )
+
+# Style layout output matrix with beautiful warnings
+        st.error("🚨 **CRITICAL FUEL INCONSISTENCY ALERTS DETECTED (POTENTIAL SIPHONING / TYPOS)**")
+        
+        # Prepare data for clean rendering
+        display_anomalies = anomalous_data.copy()
+        if not display_anomalies.empty:
+            display_anomalies['formatted_date'] = pd.to_datetime(display_anomalies['fuel_date']).dt.strftime('%Y-%m-%d')
+            
+            # SAFE CHECK: Make sure our internal calculation column exists before drawing
+            if 'distance_driven_internal' not in display_anomalies.columns:
+                display_anomalies['distance_driven_internal'] = 0.0
+
+            st.dataframe(
+                display_anomalies[[
+                    'anomaly_score', 'plate_number', 'formatted_date', 'liters_fueled', 'distance_driven_internal', 'cost_etb'
+                ]].sort_values('anomaly_score', ascending=False),
+                column_config={
+                    "anomaly_score": st.column_config.ProgressColumn(
+                        "Risk Score (%)",
+                        help="Anomaly metric certainty level compiled by Isolation Forest",
+                        format="%d%%",
+                        min_value=0,
+                        max_value=100,
+                    ),
+                    "plate_number": "🚛 Plate Number",
+                    "formatted_date": "📅 Log Date",
+                    "liters_fueled": st.column_config.NumberColumn("Liters Fueled", format="%.1f L"),
+                    "distance_driven_internal": st.column_config.NumberColumn("Est. Distance Driven", format="%d KM"),
+                    "cost_etb": st.column_config.NumberColumn("Total Cost", format="%.2f ETB")
+                },
+                hide_index=True,
+                use_container_width=True
+            )
+    else:
+        st.success("🟢 **FLEET INTEGRITY CLEAR:** The Isolation Forest found zero high-risk fuel variations or siphoning footprints within your log history.")
+
+    st.markdown("---")
+
+    # ==================================================================
+    # STANDARD HISTORICAL MATRIX FILTERS & RENDERS
+    # ==================================================================
+    st.subheader("📊 Performance Matrix Filtering")
+    
     # Date Range Filter
     col_d1, col_d2 = st.columns(2)
     start_date = col_d1.date_input("Start Date", datetime.now() - timedelta(days=30))
@@ -400,26 +561,26 @@ with tab4:
         try:
             # 1. Fetch data (Joining vehicles to get plate_number)
             response = supabase.table("fleet_fuel_logs").select("*, fleet_vehicles(plate_number)").execute()
-            df = pd.DataFrame(response.data)
+            df_filtered = pd.DataFrame(response.data)
             
             # Extract plate number from the nested dictionary
-            df['plate_number'] = df['fleet_vehicles'].apply(lambda x: x['plate_number'] if x else "Unknown")
+            df_filtered['plate_number'] = df_filtered['fleet_vehicles'].apply(lambda x: x['plate_number'] if x else "Unknown")
             
             # Apply Date Filter
-            df['fuel_date'] = pd.to_datetime(df['fuel_date'])
-            df = df[(df['fuel_date'].dt.date >= start_date) & (df['fuel_date'].dt.date <= end_date)]
+            df_filtered['fuel_date'] = pd.to_datetime(df_filtered['fuel_date'])
+            df_filtered = df_filtered[(df_filtered['fuel_date'].dt.date >= start_date) & (df_filtered['fuel_date'].dt.date <= end_date)]
             
-            if not df.empty:
+            if not df_filtered.empty:
                 # 2. Calculate Efficiency
-                df = df.sort_values(['plate_number', 'fuel_date'])
-                df['distance_driven'] = df.groupby('plate_number')['odometer_reading'].diff()
-                df['km_per_liter'] = df['distance_driven'] / df['liters_fueled']
+                df_filtered = df_filtered.sort_values(['plate_number', 'fuel_date'])
+                df_filtered['distance_driven'] = df_filtered.groupby('plate_number')['odometer_reading'].diff()
+                df_filtered['km_per_liter'] = df_filtered['distance_driven'] / df_filtered['liters_fueled']
                 
                 # 3. Summary Aggregation
-                summary = df.groupby('plate_number').agg({'cost_etb': 'sum', 'km_per_liter': 'mean'}).reset_index()
+                summary = df_filtered.groupby('plate_number').agg({'cost_etb': 'sum', 'km_per_liter': 'mean'}).reset_index()
 
                 # Commit results to app memory vault
-                st.session_state.cached_df = df
+                st.session_state.cached_df = df_filtered
                 st.session_state.cached_summary = summary
                 st.session_state.fuel_matrix_loaded = True
             else:
@@ -431,14 +592,14 @@ with tab4:
     # Persistent Render Block: If data is loaded in memory, draw the UI elements here
     if st.session_state.fuel_matrix_loaded:
         # Pull records safely out of state cache
-        df = st.session_state.cached_df
+        df_cached = st.session_state.cached_df
         summary = st.session_state.cached_summary
 
         # 4. Metrics
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Spend", f"{df['cost_etb'].sum():,.0f} ETB")
-        m2.metric("Total Liters", f"{df['liters_fueled'].sum():,.0f} L")
-        m3.metric("Fleet Avg KM/L", f"{df['km_per_liter'].mean():,.2f}")
+        m1.metric("Total Spend", f"{df_cached['cost_etb'].sum():,.0f} ETB")
+        m2.metric("Total Liters", f"{df_cached['liters_fueled'].sum():,.0f} L")
+        m3.metric("Fleet Avg KM/L", f"{df_cached['km_per_liter'].mean():,.2f}")
         
         # 5. Graph
         st.subheader("Efficiency Distribution")
@@ -466,12 +627,12 @@ with tab4:
         * <span style="color:green">**Green**</span>: Optimal fuel efficiency.
         """, unsafe_allow_html=True)
 
-       # ------------------------------------------------------------------
-        # 8. OPERATIONAL DISPATCH ROUTE CLEARANCE ENGINE (Predictive Fuel Edition)
+        # ------------------------------------------------------------------
+        # 8. OPERATIONAL DISPATCH ROUTE CLEARANCE ENGINE (ML Predictive Fuel Edition)
         # ------------------------------------------------------------------
         st.markdown("---")
         st.subheader("📋 Pre-Dispatch Route Clearance Engine")
-        st.markdown("Verify if a vehicle has an acceptable historical efficiency profile and sufficient fuel level to clear its next trip assignment.")
+        st.markdown("Verify if a vehicle has an acceptable historical efficiency profile and sufficient fuel level to clear its next trip assignment using intelligent ML forecasts.")
 
         # Layout Controls: Row 1
         col_clear1, col_clear2, col_clear3 = st.columns(3)
@@ -485,14 +646,13 @@ with tab4:
             v_efficiency = v_profile['km_per_liter']
             
         with col_clear2:
-            # Defined before the slider so math can calculate remaining percentages dynamically
             tank_size = st.number_input("Vehicle Tank Size (Liters)", min_value=40, max_value=400, value=100, step=10)
             
         with col_clear3:
             target_distance = st.number_input("Target Trip Distance (KM)", min_value=10, max_value=1500, value=250, step=50)
 
-        # --- RECONCILIATION ENGINE: PREDICTIVE CURRENT FUEL LEVEL ---
-        v_logs = df[df['plate_number'] == selected_vehicle].sort_values('fuel_date', ascending=False)
+        # --- RECONCILIATION ENGINE: MACHINE LEARNING CURRENT FUEL LEVEL FORECAST ---
+        v_logs = df_cached[df_cached['plate_number'] == selected_vehicle].sort_values('fuel_date', ascending=False)
         
         predicted_gauge_default = 50  # Operational fallback baseline
         calculation_insight = "ℹ️ No prior fuel logs found to parse an automated gauge estimation for this vehicle."
@@ -505,17 +665,56 @@ with tab4:
             current_system_time = pd.to_datetime("2026-05-29")  # Keeps processing perfectly aligned to your database scope
             days_since_refuel = (current_system_time - latest_fuel_date).days
             
-            # Extract historical average daily driving baseline for this specific profile
-            v_logs_sorted = v_logs.sort_values('fuel_date')
+            # 1. Dynamic ML Inference Context Construction
+            v_logs_sorted = v_logs.sort_values('fuel_date').copy()
+            v_logs_sorted['fuel_date'] = pd.to_datetime(v_logs_sorted['fuel_date'])
+            
             if len(v_logs_sorted) > 1:
                 total_days_active = (v_logs_sorted['fuel_date'].max() - v_logs_sorted['fuel_date'].min()).days
                 total_km_logged = v_logs_sorted['distance_driven'].sum()
-                avg_daily_km = total_km_logged / total_days_active if total_days_active > 0 else 120.0
+                fallback_daily_km = total_km_logged / total_days_active if total_days_active > 0 else 120.0
             else:
-                avg_daily_km = 120.0  # Fleet fallback average
+                fallback_daily_km = 120.0
+
+            # 2. Query ML Model Cache / Generate Predictive Insights
+            if 'get_cached_fuel_model' in globals() and len(v_logs_sorted) >= 2:
+                try:
+                    v_logs_sorted['km_driven'] = v_logs_sorted['distance_driven']
+                    v_logs_sorted['prev_date'] = v_logs_sorted['fuel_date'].shift(1)
+                    v_logs_sorted['days'] = (v_logs_sorted['fuel_date'] - v_logs_sorted['prev_date']).dt.days
+                    v_logs_sorted['km_per_day'] = v_logs_sorted['km_driven'] / v_logs_sorted['days'].replace(0, 1)
+                    
+                    last_rolling_avg = v_logs_sorted['km_per_day'].tail(3).mean()
+                    if pd.isna(last_rolling_avg):
+                        last_rolling_avg = fallback_daily_km
+                        
+                    current_odo_reading = v_logs_sorted['odometer_reading'].max()
+                    
+                    input_vector = pd.DataFrame([{
+                        'odometer_reading': current_odo_reading,
+                        'log_month': current_system_time.month,
+                        'log_day_of_week': current_system_time.weekday(),
+                        'rolling_avg_km_per_day': last_rolling_avg
+                    }])
+                    
+                    fuel_predictor_model = get_cached_fuel_model(df_cached.to_dict('records'))
+                    
+                    if fuel_predictor_model is not None:
+                        predicted_daily_km = float(fuel_predictor_model.predict(input_vector)[0])
+                        predicted_daily_km = max(predicted_daily_km, 1.0)
+                        model_type_label = "🤖 Random Forest ML Forecast"
+                    else:
+                        predicted_daily_km = fallback_daily_km
+                        model_type_label = "📊 Historic Rolling Baseline"
+                except Exception:
+                    predicted_daily_km = fallback_daily_km
+                    model_type_label = "📊 Historic Rolling Baseline"
+            else:
+                predicted_daily_km = fallback_daily_km
+                model_type_label = "📊 Historic Rolling Baseline"
                 
-            # Compute predictive depletion values
-            est_km_driven_since = max(0, days_since_refuel * avg_daily_km)
+            # 3. Compute predictive depletion metrics using the calculated utilization velocity
+            est_km_driven_since = max(0, days_since_refuel * predicted_daily_km)
             est_liters_burned = est_km_driven_since / v_efficiency if v_efficiency > 0 else 0
             
             # Derive estimated fuel level remaining inside the tank asset
@@ -524,15 +723,13 @@ with tab4:
             predicted_gauge_default = min(100, max(0, predicted_gauge_default))
             
             calculation_insight = f"""
-            💡 **Predictive Fuel Estimate:** This vehicle last fueled on **{latest_fuel_date.strftime('%Y-%m-%d')}**. 
-            Based on its historical usage of **{avg_daily_km:.1f} KM/day**, it has driven roughly **~{est_km_driven_since:,.0f} KM** since that log entry, 
+            💡 **Predictive Fuel Estimate ({model_type_label}):** This vehicle last fueled on **{latest_fuel_date.strftime('%Y-%m-%d')}**. 
+            Based on predicted structural usage of **{predicted_daily_km:.1f} KM/day**, it has driven roughly **~{est_km_driven_since:,.0f} KM** since that log entry, 
             burning **~{est_liters_burned:.1f} Liters**.
             """
 
-        # Display calculated insight right above the interactive element
         st.info(calculation_insight)
         
-        # Interactive slider now opens pre-configured to our data-driven prediction!
         fuel_gauge = st.slider(
             "Current Fuel Gauge Status (%)", 
             min_value=0, 
@@ -541,10 +738,8 @@ with tab4:
             step=5
         )
 
-        # Layout Controls: Row 2 (Status output)
         col_status = st.columns(1)[0]
         
-        # Range Math Core
         current_liters = tank_size * (fuel_gauge / 100.0)
         estimated_range = current_liters * v_efficiency
         required_safe_range = target_distance * 1.15
@@ -567,9 +762,8 @@ with tab4:
                 """)
                 
             else:
-                # Calculate shortfalls and real-world fuel cost impact based on current logs
                 liters_shortfall = (required_safe_range - estimated_range) / v_efficiency
-                avg_historical_price = df['cost_etb'].sum() / df['liters_fueled'].sum() if df['liters_fueled'].sum() > 0 else 85.0
+                avg_historical_price = df_cached['cost_etb'].sum() / df_cached['liters_fueled'].sum() if df_cached['liters_fueled'].sum() > 0 else 85.0
                 refuel_cost_etb = liters_shortfall * avg_historical_price
                 
                 st.error(f"""
