@@ -265,39 +265,63 @@ with tab2:
     with col_write:
         st.subheader("🔧 Workshop & Crew Control")
         raw_vehicles = supabase.table("fleet_vehicles").select("*").execute().data
+        
+        # --- FIXED DATABASE QUERY ---
+        # Only querying the columns that actually exist in your 'drivers' table
+        raw_drivers = supabase.table("drivers").select("id, full_name").execute().data
+        
+        # Build lookups
         vehicle_lookup = {f"{r.get('plate_number')} ({r.get('project_assignment', '')})": r.get("id") for r in raw_vehicles}
+        
+        # --- FIXED DRIVER LOOKUP ---
+        # Safely mapping the 'full_name' column to the ID
+        driver_lookup = {d.get('full_name', 'Unnamed Driver'): d.get('id') for d in raw_drivers}
         
         if vehicle_lookup:
             selected_label = st.selectbox("Select Vehicle", list(vehicle_lookup.keys()), key="tab2_vehicle_select")
             selected_id = vehicle_lookup[selected_label]
             v_rec = supabase.table("fleet_vehicles").select("*").eq("id", selected_id).execute().data[0]
 
-            # Workshop Status
+            # --- A. Workshop Status ---
             status_choice = st.radio("Workshop Status:", ["Active in Fleet ✅", "Checked Into Workshop 🛠️"], 
                                      index=1 if v_rec.get("is_in_workshop") else 0, key=f"tab2_status_{selected_id}")
             if st.button("Commit Workshop Status", key="tab2_btn_workshop"):
                 supabase.table("fleet_vehicles").update({"is_in_workshop": "Checked Into" in status_choice}).eq("id", selected_id).execute()
                 st.session_state.tab2_success_msg = "Workshop status updated!"
                 st.rerun()
+
+            # --- B. Driver Assignment ---
+            with st.expander("👤 Assign Driver"):
+                selected_driver = st.selectbox("Assign Driver", list(driver_lookup.keys()), key="driver_assign_select")
+                if st.button("Assign Driver", key="btn_assign_driver"):
+                    supabase.table("fleet_vehicles").update({"current_driver_id": driver_lookup[selected_driver]}).eq("id", selected_id).execute()
+                    st.success(f"Driver assigned to {selected_label}")
+                    st.rerun()
             
-            # Maintenance Log Form
+            # --- C. Maintenance Log Form ---
             with st.expander("➕ Log New Maintenance Service"):
                 with st.form("service_form"):
                     odo_reading = st.number_input("Odometer Reading at Service (KM)", min_value=0)
                     service_type = st.selectbox("Service Type", ["Oil Change", "Brake Repair", "Tire Rotation", "Full Inspection"])
                     submit_btn = st.form_submit_button("Submit Service Log")
+                    
                     if submit_btn:
+                        # 1. Log the service
                         supabase.table("fleet_maintenance_logs").insert({
                             "vehicle_id": selected_id,
                             "odometer_reading": odo_reading,
                             "service_type": service_type,
                             "service_date": pd.Timestamp.now().strftime('%Y-%m-%d')
                         }).execute()
-                        st.success(f"Logged {service_type}!")
+                        
+                        # 2. Update the vehicle's last_service_odometer automatically
+                        supabase.table("fleet_vehicles").update({"last_service_odometer": odo_reading}).eq("id", selected_id).execute()
+                        
+                        st.success(f"Logged {service_type} and updated record!")
                         st.rerun()
             
-            # Service Update
-            st.markdown("**Update Service Record**")
+            # --- D. Manual Service Update ---
+            st.markdown("**Update Last Service Odometer**")
             new_last_service = st.number_input("Last Service Odometer", value=int(v_rec.get("last_service_odometer", 0)), key=f"tab2_odo_{selected_id}")
             if st.button("Commit Service Update", key="tab2_btn_service"):
                 supabase.table("fleet_vehicles").update({"last_service_odometer": new_last_service}).eq("id", selected_id).execute()
